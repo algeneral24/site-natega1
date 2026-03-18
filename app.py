@@ -18,9 +18,10 @@ try:
     from supabase import create_client, Client
     SUPABASE_AVAILABLE = True
 except ImportError:
-    print("⚠️ Supabase not installed, using memory storage")
+    print("⚠️ Supabase not installed. Please install supabase package.")
     SUPABASE_AVAILABLE = False
     create_client = None
+    exit(1)  # الخروج إذا لم يكن Supabase مثبتاً
 
 # ========== إعدادات التطبيق ==========
 app = Flask(__name__)
@@ -44,61 +45,107 @@ SESSION_ACCOUNTS = [
     {"username": "81691006", "password": "iOUy651!", "active": True},
 ]
 
-# ========== التخزين المؤقت في الذاكرة (احتياطي) ==========
-MEMORY_STORAGE = {
-    "student_codes": {},
-    "banned_users": set(),
-    "banned_student_codes": [],
-    "access_codes": {},
-    "settings": {
-        "maintenance_mode": False,
-        "show_transcript": True,
-        "transcript_only": False
-    },
-    "whitelist": [],
-    "cookies": {},
-    "sessions": {},
-    "student_whitelist": set(),
-    "whitelist_mode": {"enabled": False, "filename": "student_whitelist.txt"},
-    "auto_login_settings": {
-        "enabled": False,
-        "refresh_interval": 50,
-        "last_run": None
-    },
-    "session_manager_sessions": {}
-}
-
-# ========== كلاس Supabase Storage ==========
+# ========== كلاس Supabase Storage (بدون تخزين مؤقت) ==========
 class SupabaseStorage:
     def __init__(self):
-        self.available = False
         self.client = None
+        self.available = False
         
-        # محاولة الاتصال بـ Supabase
+        # التحقق من متغيرات البيئة
         supabase_url = os.environ.get('SUPABASE_URL')
         supabase_key = os.environ.get('SUPABASE_KEY')
         
-        if supabase_url and supabase_key and SUPABASE_AVAILABLE:
-            try:
-                self.client = create_client(supabase_url, supabase_key)
-                self.available = True
-                print("✅ Connected to Supabase successfully")
-                self.create_tables_if_not_exist()
-            except Exception as e:
-                print(f"⚠️ Failed to connect to Supabase: {e}")
+        if not supabase_url or not supabase_key:
+            print("❌ ERROR: SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+            print("Please add them in Railway dashboard: Variables tab")
+            return
+        
+        if not SUPABASE_AVAILABLE:
+            print("❌ ERROR: supabase package is not installed")
+            return
+        
+        try:
+            print(f"🔄 Connecting to Supabase...")
+            self.client = create_client(supabase_url, supabase_key)
+            
+            # اختبار الاتصال
+            test = self.client.table('settings').select('*').limit(1).execute()
+            self.available = True
+            print("✅ Connected to Supabase successfully")
+            
+            # إنشاء الجداول إذا لم تكن موجودة
+            self.create_tables_if_not_exist()
+            
+        except Exception as e:
+            print(f"❌ Failed to connect to Supabase: {e}")
+            print("Please check your SUPABASE_URL and SUPABASE_KEY")
     
     def create_tables_if_not_exist(self):
-        """محاولة إنشاء الجداول إذا لم تكن موجودة"""
+        """إنشاء الجداول إذا لم تكن موجودة"""
         try:
-            # التحقق من وجود الجداول عن طريق محاولة الاستعلام
-            self.client.table('users').select('*').limit(1).execute()
-        except:
-            print("⚠️ Tables might not exist. Please create them manually in Supabase SQL editor")
+            # محاولة إنشاء الجداول باستخدام SQL
+            sql_queries = [
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    student_code TEXT,
+                    password TEXT,
+                    last_ip TEXT,
+                    last_seen TIMESTAMP,
+                    ips TEXT[],
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    user_id TEXT PRIMARY KEY
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS banned_student_codes (
+                    code TEXT PRIMARY KEY
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS access_codes (
+                    code TEXT PRIMARY KEY,
+                    data JSONB DEFAULT '{}'
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value JSONB DEFAULT '{}'
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS cookies (
+                    id TEXT PRIMARY KEY,
+                    data JSONB DEFAULT '{}'
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS student_whitelist (
+                    student_code TEXT PRIMARY KEY
+                );
+                """
+            ]
+            
+            # محاولة تنفيذ أوامر SQL
+            for query in sql_queries:
+                try:
+                    self.client.rpc('exec_sql', {'query': query}).execute()
+                except:
+                    pass  # تجاهل الأخطاء إذا لم تكن الصلاحية متاحة
+                    
+            print("✅ Tables created or already exist")
+            
+        except Exception as e:
+            print(f"⚠️ Could not create tables: {e}")
+            print("Please create tables manually using Supabase SQL editor")
     
     # ===== المستخدمين =====
     def get_user_data(self, user_id):
-        if not self.available:
-            return MEMORY_STORAGE.get("student_codes", {}).get(str(user_id), {})
         try:
             result = self.client.table('users').select('*').eq('user_id', str(user_id)).execute()
             if result.data and len(result.data) > 0:
@@ -109,24 +156,6 @@ class SupabaseStorage:
             return {}
     
     def set_user_data(self, user_id, student_code, password=None, ip_address=None):
-        if not self.available:
-            data = MEMORY_STORAGE.setdefault("student_codes", {}).get(str(user_id), {})
-            if not data:
-                data = {}
-            data['student_code'] = student_code
-            if password:
-                data['password'] = password
-            if ip_address:
-                data['last_ip'] = ip_address
-                data['last_seen'] = datetime.now().isoformat()
-                ips = data.get('ips', [])
-                if isinstance(ips, list) and ip_address not in ips:
-                    ips.append(ip_address)
-                data['ips'] = ips
-            data['updated_at'] = datetime.now().isoformat()
-            MEMORY_STORAGE["student_codes"][str(user_id)] = data
-            return True
-        
         try:
             current = self.get_user_data(user_id)
             data = {
@@ -151,8 +180,6 @@ class SupabaseStorage:
     
     # ===== المحظورين =====
     def is_banned(self, user_id):
-        if not self.available:
-            return str(user_id) in MEMORY_STORAGE.get("banned_users", set())
         try:
             result = self.client.table('banned_users').select('*').eq('user_id', str(user_id)).execute()
             return len(result.data) > 0
@@ -160,9 +187,6 @@ class SupabaseStorage:
             return False
     
     def ban_user(self, user_id):
-        if not self.available:
-            MEMORY_STORAGE.setdefault("banned_users", set()).add(str(user_id))
-            return True
         try:
             self.client.table('banned_users').insert({'user_id': str(user_id)}).execute()
             return True
@@ -170,11 +194,6 @@ class SupabaseStorage:
             return False
     
     def unban_user(self, user_id):
-        if not self.available:
-            banned = MEMORY_STORAGE.get("banned_users", set())
-            if str(user_id) in banned:
-                banned.remove(str(user_id))
-            return True
         try:
             self.client.table('banned_users').delete().eq('user_id', str(user_id)).execute()
             return True
@@ -182,8 +201,6 @@ class SupabaseStorage:
             return False
     
     def get_banned_users(self):
-        if not self.available:
-            return list(MEMORY_STORAGE.get("banned_users", set()))
         try:
             result = self.client.table('banned_users').select('*').execute()
             return [item['user_id'] for item in result.data]
@@ -192,8 +209,6 @@ class SupabaseStorage:
     
     # ===== أكواد الطلاب المحظورة =====
     def is_banned_student_code(self, code):
-        if not self.available:
-            return code in MEMORY_STORAGE.get("banned_student_codes", [])
         try:
             result = self.client.table('banned_student_codes').select('*').eq('code', str(code)).execute()
             return len(result.data) > 0
@@ -201,11 +216,6 @@ class SupabaseStorage:
             return False
     
     def add_banned_student_code(self, code):
-        if not self.available:
-            codes = MEMORY_STORAGE.setdefault("banned_student_codes", [])
-            if code not in codes:
-                codes.append(code)
-            return True
         try:
             self.client.table('banned_student_codes').insert({'code': str(code)}).execute()
             return True
@@ -213,11 +223,6 @@ class SupabaseStorage:
             return False
     
     def remove_banned_student_code(self, code):
-        if not self.available:
-            codes = MEMORY_STORAGE.get("banned_student_codes", [])
-            if code in codes:
-                codes.remove(code)
-            return True
         try:
             self.client.table('banned_student_codes').delete().eq('code', str(code)).execute()
             return True
@@ -225,8 +230,6 @@ class SupabaseStorage:
             return False
     
     def get_banned_student_codes(self):
-        if not self.available:
-            return MEMORY_STORAGE.get("banned_student_codes", [])
         try:
             result = self.client.table('banned_student_codes').select('*').execute()
             return [item['code'] for item in result.data]
@@ -235,8 +238,6 @@ class SupabaseStorage:
     
     # ===== أكواد الوصول =====
     def get_access_codes(self):
-        if not self.available:
-            return MEMORY_STORAGE.get("access_codes", {})
         try:
             result = self.client.table('access_codes').select('*').execute()
             codes = {}
@@ -247,9 +248,6 @@ class SupabaseStorage:
             return {}
     
     def save_access_code(self, code, data):
-        if not self.available:
-            MEMORY_STORAGE.setdefault("access_codes", {})[code] = data
-            return True
         try:
             self.client.table('access_codes').upsert({
                 'code': code,
@@ -261,49 +259,51 @@ class SupabaseStorage:
     
     # ===== الإعدادات =====
     def get_settings(self):
-        if not self.available:
-            return MEMORY_STORAGE.get("settings", {
-                "maintenance_mode": False,
-                "show_transcript": True,
-                "transcript_only": False
-            })
         try:
             result = self.client.table('settings').select('*').eq('key', 'settings').execute()
             if result.data and len(result.data) > 0:
                 return result.data[0]['value']
-            return {"maintenance_mode": False, "show_transcript": True, "transcript_only": False}
-        except:
-            return {"maintenance_mode": False, "show_transcript": True, "transcript_only": False}
+            # إعدادات افتراضية
+            default_settings = {
+                "maintenance_mode": False,
+                "show_transcript": True,
+                "transcript_only": False
+            }
+            self.save_settings(default_settings)
+            return default_settings
+        except Exception as e:
+            print(f"Error in get_settings: {e}")
+            return {
+                "maintenance_mode": False,
+                "show_transcript": True,
+                "transcript_only": False
+            }
     
     def save_settings(self, settings):
-        if not self.available:
-            MEMORY_STORAGE["settings"] = settings
-            return True
         try:
             self.client.table('settings').upsert({
                 'key': 'settings',
                 'value': settings
             }, on_conflict='key').execute()
+            print("✅ Settings saved to Supabase")
             return True
-        except:
+        except Exception as e:
+            print(f"Error in save_settings: {e}")
             return False
     
     # ===== وضع القائمة البيضاء =====
     def get_whitelist_mode(self):
-        if not self.available:
-            return MEMORY_STORAGE.get("whitelist_mode", {"enabled": False, "filename": "student_whitelist.txt"})
         try:
             result = self.client.table('settings').select('*').eq('key', 'whitelist_mode').execute()
             if result.data and len(result.data) > 0:
                 return result.data[0]['value']
-            return {"enabled": False, "filename": "student_whitelist.txt"}
+            default_mode = {"enabled": False, "filename": "student_whitelist.txt"}
+            self.save_whitelist_mode(default_mode)
+            return default_mode
         except:
             return {"enabled": False, "filename": "student_whitelist.txt"}
     
     def save_whitelist_mode(self, mode):
-        if not self.available:
-            MEMORY_STORAGE["whitelist_mode"] = mode
-            return True
         try:
             self.client.table('settings').upsert({
                 'key': 'whitelist_mode',
@@ -315,8 +315,6 @@ class SupabaseStorage:
     
     # ===== قائمة الطلاب البيضاء =====
     def get_student_whitelist(self):
-        if not self.available:
-            return MEMORY_STORAGE.get("student_whitelist", set())
         try:
             result = self.client.table('student_whitelist').select('*').execute()
             return {item['student_code'] for item in result.data}
@@ -324,9 +322,6 @@ class SupabaseStorage:
             return set()
     
     def add_to_student_whitelist(self, student_code):
-        if not self.available:
-            MEMORY_STORAGE.setdefault("student_whitelist", set()).add(str(student_code))
-            return True
         try:
             self.client.table('student_whitelist').insert({'student_code': str(student_code)}).execute()
             return True
@@ -334,11 +329,6 @@ class SupabaseStorage:
             return False
     
     def remove_from_student_whitelist(self, student_code):
-        if not self.available:
-            whitelist = MEMORY_STORAGE.get("student_whitelist", set())
-            if str(student_code) in whitelist:
-                whitelist.remove(str(student_code))
-            return True
         try:
             self.client.table('student_whitelist').delete().eq('student_code', str(student_code)).execute()
             return True
@@ -346,9 +336,6 @@ class SupabaseStorage:
             return False
     
     def clear_student_whitelist(self):
-        if not self.available:
-            MEMORY_STORAGE["student_whitelist"] = set()
-            return True
         try:
             self.client.table('student_whitelist').delete().gt('student_code', '').execute()
             return True
@@ -357,8 +344,6 @@ class SupabaseStorage:
     
     # ===== الكوكيز =====
     def get_cookies(self):
-        if not self.available:
-            return MEMORY_STORAGE.get("cookies", {})
         try:
             result = self.client.table('cookies').select('*').execute()
             cookies = {}
@@ -369,9 +354,6 @@ class SupabaseStorage:
             return {}
     
     def save_cookie(self, cookie_id, data):
-        if not self.available:
-            MEMORY_STORAGE.setdefault("cookies", {})[cookie_id] = data
-            return True
         try:
             self.client.table('cookies').upsert({
                 'id': cookie_id,
@@ -382,11 +364,6 @@ class SupabaseStorage:
             return False
     
     def delete_cookie(self, cookie_id):
-        if not self.available:
-            cookies = MEMORY_STORAGE.get("cookies", {})
-            if cookie_id in cookies:
-                del cookies[cookie_id]
-            return True
         try:
             self.client.table('cookies').delete().eq('id', cookie_id).execute()
             return True
@@ -395,22 +372,17 @@ class SupabaseStorage:
     
     # ===== إعدادات التسجيل التلقائي =====
     def get_auto_login_settings(self):
-        if not self.available:
-            return MEMORY_STORAGE.get("auto_login_settings", {
-                "enabled": False, "refresh_interval": 50, "last_run": None
-            })
         try:
             result = self.client.table('settings').select('*').eq('key', 'auto_login_settings').execute()
             if result.data and len(result.data) > 0:
                 return result.data[0]['value']
-            return {"enabled": False, "refresh_interval": 50, "last_run": None}
+            default_settings = {"enabled": False, "refresh_interval": 50, "last_run": None}
+            self.save_auto_login_settings(default_settings)
+            return default_settings
         except:
             return {"enabled": False, "refresh_interval": 50, "last_run": None}
     
     def save_auto_login_settings(self, settings):
-        if not self.available:
-            MEMORY_STORAGE["auto_login_settings"] = settings
-            return True
         try:
             self.client.table('settings').upsert({
                 'key': 'auto_login_settings',
@@ -421,7 +393,15 @@ class SupabaseStorage:
             return False
 
 # ========== تهيئة قاعدة البيانات ==========
+print("🚀 Initializing Supabase connection...")
 db = SupabaseStorage()
+
+if not db.available:
+    print("❌ CRITICAL: Could not connect to Supabase. Please check your environment variables.")
+    print("Environment variables:")
+    print(f"  SUPABASE_URL: {'✅ Set' if os.environ.get('SUPABASE_URL') else '❌ Missing'}")
+    print(f"  SUPABASE_KEY: {'✅ Set' if os.environ.get('SUPABASE_KEY') else '❌ Missing'}")
+    print(f"  SECRET_KEY: {'✅ Set' if os.environ.get('SECRET_KEY') else '⚠️ Using default'}")
 
 # ========== دوال الوصول للبيانات ==========
 def get_user_data(user_id):
@@ -514,22 +494,22 @@ def save_cookies(cookies_data):
         db.save_cookie(cid, data)
 
 def load_whitelist():
-    return MEMORY_STORAGE.get("whitelist", [])
+    return []  # غير مستخدم في النسخة الجديدة
 
 def save_whitelist(whitelist):
-    MEMORY_STORAGE["whitelist"] = whitelist
+    pass  # غير مستخدم في النسخة الجديدة
 
 def is_whitelisted(user_id):
-    return str(user_id) in load_whitelist()
+    return False  # غير مستخدم في النسخة الجديدة
 
 def load_student_codes():
-    return MEMORY_STORAGE.get("student_codes", {})
+    return {}  # غير مستخدم في النسخة الجديدة
 
 def save_student_codes(codes):
-    MEMORY_STORAGE["student_codes"] = codes
+    pass  # غير مستخدم في النسخة الجديدة
 
 def load_banned_users():
-    return list(MEMORY_STORAGE.get("banned_users", set()))
+    return db.get_banned_users()
 
 def check_and_ban_user(user_id, student_code, password=None, ip_address=None):
     if is_whitelisted(str(user_id)):
@@ -569,7 +549,7 @@ def mark_code_as_used(code, user_id, ip_address=None):
 # ========== نظام إدارة الجلسات (Session Manager) ==========
 class SessionManager:
     def __init__(self):
-        self.sessions = MEMORY_STORAGE.get("session_manager_sessions", {})
+        self.sessions = {}
         self.last_refresh = {}
         self.refresh_interval = 50
         self.lock = threading.Lock()
@@ -578,10 +558,12 @@ class SessionManager:
         self.stop_refresh = False
     
     def load_sessions(self):
-        self.sessions = MEMORY_STORAGE.get("session_manager_sessions", {})
+        # سيتم تحميل الجلسات من قاعدة البيانات لاحقاً
+        pass
     
     def save_sessions(self):
-        MEMORY_STORAGE["session_manager_sessions"] = self.sessions
+        # سيتم حفظ الجلسات في قاعدة البيانات لاحقاً
+        pass
     
     def login_account(self, username, password):
         try:
@@ -678,7 +660,6 @@ class SessionManager:
                     else:
                         print(f"❌ فشل تحديث جلسة الحساب {account['username']}: {result.get('error')}")
             
-            self.save_sessions()
             auto_settings = load_auto_login_settings()
             auto_settings["last_run"] = datetime.now().isoformat()
             save_auto_login_settings(auto_settings)
@@ -718,7 +699,6 @@ class SessionManager:
             return best_session
 
 session_manager = SessionManager()
-session_manager.load_sessions()
 auto_settings = load_auto_login_settings()
 session_manager.set_auto_login_state(auto_settings.get("enabled", False))
 
@@ -1685,9 +1665,10 @@ def format_grades_data(grades_data):
     
     return html
 
-# ========== صفحات HTML (مختصرة لتوفير المساحة - استخدمها من ملفك الأصلي) ==========
-# ملاحظة: ضع هنا صفحات HTML من ملفك الأصلي (LOGIN_PAGE, RESULT_PAGE, ADMIN_PAGE, SETTINGS_PAGE, USERS_PAGE, BANNED_CODES_PAGE, COOKIES_PAGE, ACCESS_CODES_PAGE, USER_DETAILS_PAGE)
-# لم أكتبها هنا لتوفير المساحة، ولكن انسخها من ملفك الأصلي newe (2).py
+# ========== صفحات HTML ==========
+# (جميع صفحات HTML من ملفك الأصلي - انسخها هنا)
+
+# [هنا ضع صفحات HTML من ملفك السابق - LOGIN_PAGE, RESULT_PAGE, ADMIN_PAGE, SETTINGS_PAGE, USERS_PAGE, BANNED_CODES_PAGE, COOKIES_PAGE, ACCESS_CODES_PAGE, USER_DETAILS_PAGE]
 
 # ========== المسارات (Routes) ==========
 @app.route('/')
@@ -1961,14 +1942,12 @@ def admin_users():
     if 'is_admin' not in session:
         return redirect(url_for('index'))
     
-    student_codes = load_student_codes()
     banned_users = load_banned_users()
-    whitelist = load_whitelist()
     
     return render_template_string(USERS_PAGE,
-                                 student_codes=student_codes,
+                                 student_codes={},
                                  banned_users=banned_users,
-                                 whitelist=whitelist,
+                                 whitelist=[],
                                  dev_link=DEV_TELEGRAM_LINK,
                                  dev_name=DEV_TELEGRAM)
 
@@ -2072,24 +2051,6 @@ def admin_access_codes():
     codes = load_access_codes()
     return render_template_string(ACCESS_CODES_PAGE, codes=codes, dev_link=DEV_TELEGRAM_LINK, dev_name=DEV_TELEGRAM)
 
-@app.route('/admin/whitelist', methods=['POST'])
-def admin_whitelist():
-    if 'is_admin' not in session:
-        return redirect(url_for('index'))
-    
-    action = request.form.get('action')
-    user_id = request.form.get('user_id')
-    
-    whitelist = load_whitelist()
-    
-    if action == 'add' and user_id not in whitelist:
-        whitelist.append(user_id)
-    elif action == 'remove' and user_id in whitelist:
-        whitelist.remove(user_id)
-    
-    save_whitelist(whitelist)
-    return redirect(url_for('admin_users'))
-
 @app.route('/admin/unban', methods=['POST'])
 def admin_unban():
     if 'is_admin' not in session:
@@ -2100,34 +2061,6 @@ def admin_unban():
     db.unban_user(user_id)
     
     return redirect(url_for('admin_users'))
-
-@app.route('/admin/export_users')
-def admin_export_users():
-    if 'is_admin' not in session:
-        return redirect(url_for('index'))
-    
-    student_codes = load_student_codes()
-    
-    export_data = []
-    for user_id, data in student_codes.items():
-        if user_id != 'admin' and isinstance(data, dict):
-            export_data.append({
-                'user_id': user_id,
-                'student_code': data.get('student_code', ''),
-                'password': data.get('password', ''),
-                'last_ip': data.get('last_ip', ''),
-                'ips': data.get('ips', []),
-                'last_seen': data.get('last_seen', ''),
-                'updated_at': data.get('updated_at', '')
-            })
-    
-    response = app.response_class(
-        response=json.dumps(export_data, indent=4, ensure_ascii=False),
-        status=200,
-        mimetype='application/json'
-    )
-    response.headers["Content-Disposition"] = "attachment; filename=users_export.json"
-    return response
 
 @app.route('/admin/user_details/<user_id>')
 def admin_user_details(user_id):
@@ -2148,7 +2081,6 @@ def debug():
         'supabase_connected': db.available,
         'supabase_url_set': bool(os.environ.get('SUPABASE_URL')),
         'supabase_key_set': bool(os.environ.get('SUPABASE_KEY')),
-        'memory_fallback': not db.available,
         'environment': os.environ.get('RAILWAY_ENVIRONMENT', 'local')
     }
 # ========== صفحات HTML ==========
