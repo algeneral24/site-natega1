@@ -6,14 +6,21 @@ import os
 from functools import wraps
 from datetime import datetime, timedelta
 import hashlib
-import csv
 import threading
-from io import StringIO
 import urllib.parse
-from supabase_client import SupabaseStorage
+from dotenv import load_dotenv
 
-# ========== إعدادات التخزين الدائم ==========
-db = SupabaseStorage()
+# تحميل متغيرات البيئة من ملف .env (للتطوير المحلي)
+load_dotenv()
+
+# ========== إعدادات Supabase ==========
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    print("⚠️ Supabase not installed, using memory storage")
+    SUPABASE_AVAILABLE = False
+    create_client = None
 
 # ========== إعدادات التطبيق ==========
 app = Flask(__name__)
@@ -32,26 +39,398 @@ ADMIN_PASSWORD = "admin123"
 DEV_TELEGRAM = "𓆩⋆ ׅᎯ𝔹Ꮇ ׅ⋆𓆪"
 DEV_TELEGRAM_LINK = "https://t.me/BO_R0"
 
-# ========== حساب الجلسات الدائمة ==========
+# ========== حسابات الجلسات الدائمة ==========
 SESSION_ACCOUNTS = [
-    {
-        "username": "81691006",
-        "password": "iOUy651!",
-        "active": True
-    },
+    {"username": "81691006", "password": "iOUy651!", "active": True},
 ]
 
-# ========== دوال الوصول للبيانات (معدلة للاستخدام مع Supabase) ==========
+# ========== التخزين المؤقت في الذاكرة (احتياطي) ==========
+MEMORY_STORAGE = {
+    "student_codes": {},
+    "banned_users": set(),
+    "banned_student_codes": [],
+    "access_codes": {},
+    "settings": {
+        "maintenance_mode": False,
+        "show_transcript": True,
+        "transcript_only": False
+    },
+    "whitelist": [],
+    "cookies": {},
+    "sessions": {},
+    "student_whitelist": set(),
+    "whitelist_mode": {"enabled": False, "filename": "student_whitelist.txt"},
+    "auto_login_settings": {
+        "enabled": False,
+        "refresh_interval": 50,
+        "last_run": None
+    },
+    "session_manager_sessions": {}
+}
+
+# ========== كلاس Supabase Storage ==========
+class SupabaseStorage:
+    def __init__(self):
+        self.available = False
+        self.client = None
+        
+        # محاولة الاتصال بـ Supabase
+        supabase_url = os.environ.get('SUPABASE_URL')
+        supabase_key = os.environ.get('SUPABASE_KEY')
+        
+        if supabase_url and supabase_key and SUPABASE_AVAILABLE:
+            try:
+                self.client = create_client(supabase_url, supabase_key)
+                self.available = True
+                print("✅ Connected to Supabase successfully")
+                self.create_tables_if_not_exist()
+            except Exception as e:
+                print(f"⚠️ Failed to connect to Supabase: {e}")
+    
+    def create_tables_if_not_exist(self):
+        """محاولة إنشاء الجداول إذا لم تكن موجودة"""
+        try:
+            # التحقق من وجود الجداول عن طريق محاولة الاستعلام
+            self.client.table('users').select('*').limit(1).execute()
+        except:
+            print("⚠️ Tables might not exist. Please create them manually in Supabase SQL editor")
+    
+    # ===== المستخدمين =====
+    def get_user_data(self, user_id):
+        if not self.available:
+            return MEMORY_STORAGE.get("student_codes", {}).get(str(user_id), {})
+        try:
+            result = self.client.table('users').select('*').eq('user_id', str(user_id)).execute()
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return {}
+        except Exception as e:
+            print(f"Error in get_user_data: {e}")
+            return {}
+    
+    def set_user_data(self, user_id, student_code, password=None, ip_address=None):
+        if not self.available:
+            data = MEMORY_STORAGE.setdefault("student_codes", {}).get(str(user_id), {})
+            if not data:
+                data = {}
+            data['student_code'] = student_code
+            if password:
+                data['password'] = password
+            if ip_address:
+                data['last_ip'] = ip_address
+                data['last_seen'] = datetime.now().isoformat()
+                ips = data.get('ips', [])
+                if isinstance(ips, list) and ip_address not in ips:
+                    ips.append(ip_address)
+                data['ips'] = ips
+            data['updated_at'] = datetime.now().isoformat()
+            MEMORY_STORAGE["student_codes"][str(user_id)] = data
+            return True
+        
+        try:
+            current = self.get_user_data(user_id)
+            data = {
+                'user_id': str(user_id),
+                'student_code': student_code,
+                'updated_at': datetime.now().isoformat()
+            }
+            if password:
+                data['password'] = password
+            if ip_address:
+                data['last_ip'] = ip_address
+                data['last_seen'] = datetime.now().isoformat()
+                ips = current.get('ips', [])
+                if isinstance(ips, list) and ip_address not in ips:
+                    ips.append(ip_address)
+                data['ips'] = ips
+            self.client.table('users').upsert(data, on_conflict='user_id').execute()
+            return True
+        except Exception as e:
+            print(f"Error in set_user_data: {e}")
+            return False
+    
+    # ===== المحظورين =====
+    def is_banned(self, user_id):
+        if not self.available:
+            return str(user_id) in MEMORY_STORAGE.get("banned_users", set())
+        try:
+            result = self.client.table('banned_users').select('*').eq('user_id', str(user_id)).execute()
+            return len(result.data) > 0
+        except:
+            return False
+    
+    def ban_user(self, user_id):
+        if not self.available:
+            MEMORY_STORAGE.setdefault("banned_users", set()).add(str(user_id))
+            return True
+        try:
+            self.client.table('banned_users').insert({'user_id': str(user_id)}).execute()
+            return True
+        except:
+            return False
+    
+    def unban_user(self, user_id):
+        if not self.available:
+            banned = MEMORY_STORAGE.get("banned_users", set())
+            if str(user_id) in banned:
+                banned.remove(str(user_id))
+            return True
+        try:
+            self.client.table('banned_users').delete().eq('user_id', str(user_id)).execute()
+            return True
+        except:
+            return False
+    
+    def get_banned_users(self):
+        if not self.available:
+            return list(MEMORY_STORAGE.get("banned_users", set()))
+        try:
+            result = self.client.table('banned_users').select('*').execute()
+            return [item['user_id'] for item in result.data]
+        except:
+            return []
+    
+    # ===== أكواد الطلاب المحظورة =====
+    def is_banned_student_code(self, code):
+        if not self.available:
+            return code in MEMORY_STORAGE.get("banned_student_codes", [])
+        try:
+            result = self.client.table('banned_student_codes').select('*').eq('code', str(code)).execute()
+            return len(result.data) > 0
+        except:
+            return False
+    
+    def add_banned_student_code(self, code):
+        if not self.available:
+            codes = MEMORY_STORAGE.setdefault("banned_student_codes", [])
+            if code not in codes:
+                codes.append(code)
+            return True
+        try:
+            self.client.table('banned_student_codes').insert({'code': str(code)}).execute()
+            return True
+        except:
+            return False
+    
+    def remove_banned_student_code(self, code):
+        if not self.available:
+            codes = MEMORY_STORAGE.get("banned_student_codes", [])
+            if code in codes:
+                codes.remove(code)
+            return True
+        try:
+            self.client.table('banned_student_codes').delete().eq('code', str(code)).execute()
+            return True
+        except:
+            return False
+    
+    def get_banned_student_codes(self):
+        if not self.available:
+            return MEMORY_STORAGE.get("banned_student_codes", [])
+        try:
+            result = self.client.table('banned_student_codes').select('*').execute()
+            return [item['code'] for item in result.data]
+        except:
+            return []
+    
+    # ===== أكواد الوصول =====
+    def get_access_codes(self):
+        if not self.available:
+            return MEMORY_STORAGE.get("access_codes", {})
+        try:
+            result = self.client.table('access_codes').select('*').execute()
+            codes = {}
+            for item in result.data:
+                codes[item['code']] = item['data']
+            return codes
+        except:
+            return {}
+    
+    def save_access_code(self, code, data):
+        if not self.available:
+            MEMORY_STORAGE.setdefault("access_codes", {})[code] = data
+            return True
+        try:
+            self.client.table('access_codes').upsert({
+                'code': code,
+                'data': data
+            }, on_conflict='code').execute()
+            return True
+        except:
+            return False
+    
+    # ===== الإعدادات =====
+    def get_settings(self):
+        if not self.available:
+            return MEMORY_STORAGE.get("settings", {
+                "maintenance_mode": False,
+                "show_transcript": True,
+                "transcript_only": False
+            })
+        try:
+            result = self.client.table('settings').select('*').eq('key', 'settings').execute()
+            if result.data and len(result.data) > 0:
+                return result.data[0]['value']
+            return {"maintenance_mode": False, "show_transcript": True, "transcript_only": False}
+        except:
+            return {"maintenance_mode": False, "show_transcript": True, "transcript_only": False}
+    
+    def save_settings(self, settings):
+        if not self.available:
+            MEMORY_STORAGE["settings"] = settings
+            return True
+        try:
+            self.client.table('settings').upsert({
+                'key': 'settings',
+                'value': settings
+            }, on_conflict='key').execute()
+            return True
+        except:
+            return False
+    
+    # ===== وضع القائمة البيضاء =====
+    def get_whitelist_mode(self):
+        if not self.available:
+            return MEMORY_STORAGE.get("whitelist_mode", {"enabled": False, "filename": "student_whitelist.txt"})
+        try:
+            result = self.client.table('settings').select('*').eq('key', 'whitelist_mode').execute()
+            if result.data and len(result.data) > 0:
+                return result.data[0]['value']
+            return {"enabled": False, "filename": "student_whitelist.txt"}
+        except:
+            return {"enabled": False, "filename": "student_whitelist.txt"}
+    
+    def save_whitelist_mode(self, mode):
+        if not self.available:
+            MEMORY_STORAGE["whitelist_mode"] = mode
+            return True
+        try:
+            self.client.table('settings').upsert({
+                'key': 'whitelist_mode',
+                'value': mode
+            }, on_conflict='key').execute()
+            return True
+        except:
+            return False
+    
+    # ===== قائمة الطلاب البيضاء =====
+    def get_student_whitelist(self):
+        if not self.available:
+            return MEMORY_STORAGE.get("student_whitelist", set())
+        try:
+            result = self.client.table('student_whitelist').select('*').execute()
+            return {item['student_code'] for item in result.data}
+        except:
+            return set()
+    
+    def add_to_student_whitelist(self, student_code):
+        if not self.available:
+            MEMORY_STORAGE.setdefault("student_whitelist", set()).add(str(student_code))
+            return True
+        try:
+            self.client.table('student_whitelist').insert({'student_code': str(student_code)}).execute()
+            return True
+        except:
+            return False
+    
+    def remove_from_student_whitelist(self, student_code):
+        if not self.available:
+            whitelist = MEMORY_STORAGE.get("student_whitelist", set())
+            if str(student_code) in whitelist:
+                whitelist.remove(str(student_code))
+            return True
+        try:
+            self.client.table('student_whitelist').delete().eq('student_code', str(student_code)).execute()
+            return True
+        except:
+            return False
+    
+    def clear_student_whitelist(self):
+        if not self.available:
+            MEMORY_STORAGE["student_whitelist"] = set()
+            return True
+        try:
+            self.client.table('student_whitelist').delete().gt('student_code', '').execute()
+            return True
+        except:
+            return False
+    
+    # ===== الكوكيز =====
+    def get_cookies(self):
+        if not self.available:
+            return MEMORY_STORAGE.get("cookies", {})
+        try:
+            result = self.client.table('cookies').select('*').execute()
+            cookies = {}
+            for item in result.data:
+                cookies[item['id']] = item['data']
+            return cookies
+        except:
+            return {}
+    
+    def save_cookie(self, cookie_id, data):
+        if not self.available:
+            MEMORY_STORAGE.setdefault("cookies", {})[cookie_id] = data
+            return True
+        try:
+            self.client.table('cookies').upsert({
+                'id': cookie_id,
+                'data': data
+            }, on_conflict='id').execute()
+            return True
+        except:
+            return False
+    
+    def delete_cookie(self, cookie_id):
+        if not self.available:
+            cookies = MEMORY_STORAGE.get("cookies", {})
+            if cookie_id in cookies:
+                del cookies[cookie_id]
+            return True
+        try:
+            self.client.table('cookies').delete().eq('id', cookie_id).execute()
+            return True
+        except:
+            return False
+    
+    # ===== إعدادات التسجيل التلقائي =====
+    def get_auto_login_settings(self):
+        if not self.available:
+            return MEMORY_STORAGE.get("auto_login_settings", {
+                "enabled": False, "refresh_interval": 50, "last_run": None
+            })
+        try:
+            result = self.client.table('settings').select('*').eq('key', 'auto_login_settings').execute()
+            if result.data and len(result.data) > 0:
+                return result.data[0]['value']
+            return {"enabled": False, "refresh_interval": 50, "last_run": None}
+        except:
+            return {"enabled": False, "refresh_interval": 50, "last_run": None}
+    
+    def save_auto_login_settings(self, settings):
+        if not self.available:
+            MEMORY_STORAGE["auto_login_settings"] = settings
+            return True
+        try:
+            self.client.table('settings').upsert({
+                'key': 'auto_login_settings',
+                'value': settings
+            }, on_conflict='key').execute()
+            return True
+        except:
+            return False
+
+# ========== تهيئة قاعدة البيانات ==========
+db = SupabaseStorage()
+
+# ========== دوال الوصول للبيانات ==========
 def get_user_data(user_id):
-    """جلب بيانات المستخدم من Supabase"""
     return db.get_user_data(user_id)
 
 def set_user_data(user_id, student_code, password=None, ip_address=None):
-    """حفظ بيانات المستخدم في Supabase"""
     db.set_user_data(user_id, student_code, password, ip_address)
 
 def get_user_ip(request):
-    """الحصول على IP المستخدم"""
     if request.headers.get('X-Forwarded-For'):
         return request.headers.get('X-Forwarded-For').split(',')[0].strip()
     elif request.headers.get('X-Real-IP'):
@@ -60,107 +439,99 @@ def get_user_ip(request):
         return request.remote_addr or '0.0.0.0'
 
 def load_access_codes():
-    """تحميل أكواد الوصول"""
     return db.get_access_codes()
 
 def save_access_codes(codes):
-    """حفظ أكواد الوصول"""
     for code, data in codes.items():
         db.save_access_code(code, data)
 
 def load_settings():
-    """تحميل الإعدادات"""
     return db.get_settings()
 
 def save_settings(settings):
-    """حفظ الإعدادات"""
     db.save_settings(settings)
 
 def load_whitelist_mode():
-    """تحميل وضع القائمة البيضاء"""
     return db.get_whitelist_mode()
 
 def save_whitelist_mode(mode):
-    """حفظ وضع القائمة البيضاء"""
     db.save_whitelist_mode(mode)
 
 def load_student_whitelist():
-    """تحميل قائمة الطلاب المسموح لهم"""
     return db.get_student_whitelist()
 
 def save_student_whitelist(students_set, filename=None):
-    """حفظ قائمة الطلاب المسموح لهم"""
-    # مسح القائمة الحالية وإضافة الجديدة
     db.clear_student_whitelist()
     for code in students_set:
         db.add_to_student_whitelist(code)
 
 def add_to_student_whitelist(student_code):
-    """إضافة طالب إلى القائمة البيضاء"""
     db.add_to_student_whitelist(student_code)
 
 def remove_from_student_whitelist(student_code):
-    """حذف طالب من القائمة البيضاء"""
     db.remove_from_student_whitelist(student_code)
 
 def is_student_whitelisted(student_code):
-    """التحقق مما إذا كان الطالب مسموح له باستخدام النظام"""
     mode = load_whitelist_mode()
     if not mode.get("enabled", False):
         return True
-    
     whitelist = load_student_whitelist()
     return str(student_code) in whitelist
 
 def is_banned(user_id):
-    """التحقق مما إذا كان المستخدم محظوراً"""
     return db.is_banned(user_id)
 
 def save_banned_user(user_id):
-    """حظر مستخدم"""
     db.ban_user(user_id)
 
 def load_banned_student_codes():
-    """تحميل أكواد الطلاب المحظورة"""
     return db.get_banned_student_codes()
 
 def save_banned_student_codes(codes):
-    """حفظ أكواد الطلاب المحظورة"""
-    # ملاحظة: هذه الدالة تحتاج تحسين حسب الاستخدام
-    pass
+    for code in codes:
+        db.add_banned_student_code(code)
 
 def is_banned_student_code(student_code):
-    """التحقق مما إذا كان كود الطالب محظوراً"""
     return db.is_banned_student_code(student_code)
 
 def add_banned_student_code(code):
-    """إضافة كود طالب إلى قائمة المحظورين"""
     db.add_banned_student_code(code)
 
 def remove_banned_student_code(code):
-    """إزالة كود طالب من قائمة المحظورين"""
     db.remove_banned_student_code(code)
 
 def load_auto_login_settings():
-    """تحميل إعدادات التسجيل التلقائي"""
     return db.get_auto_login_settings()
 
 def save_auto_login_settings(settings):
-    """حفظ إعدادات التسجيل التلقائي"""
     db.save_auto_login_settings(settings)
 
 def load_cookies():
-    """تحميل الكوكيز"""
     return db.get_cookies()
 
 def save_cookies(cookies_data):
-    """حفظ الكوكيز"""
     for cid, data in cookies_data.items():
         db.save_cookie(cid, data)
 
+def load_whitelist():
+    return MEMORY_STORAGE.get("whitelist", [])
+
+def save_whitelist(whitelist):
+    MEMORY_STORAGE["whitelist"] = whitelist
+
+def is_whitelisted(user_id):
+    return str(user_id) in load_whitelist()
+
+def load_student_codes():
+    return MEMORY_STORAGE.get("student_codes", {})
+
+def save_student_codes(codes):
+    MEMORY_STORAGE["student_codes"] = codes
+
+def load_banned_users():
+    return list(MEMORY_STORAGE.get("banned_users", set()))
+
 def check_and_ban_user(user_id, student_code, password=None, ip_address=None):
-    """التحقق من كود الطالب والباسورد مع الاعتماد على IP المخزن"""
-    
     if is_whitelisted(str(user_id)):
         return False, "whitelist_bypass"
     
@@ -171,7 +542,6 @@ def check_and_ban_user(user_id, student_code, password=None, ip_address=None):
     
     saved_code = user_data.get("student_code")
     saved_password = user_data.get("password")
-    saved_ips = user_data.get("ips", [])
     
     if not saved_code:
         set_user_data(user_id, student_code, password, ip_address)
@@ -185,17 +555,7 @@ def check_and_ban_user(user_id, student_code, password=None, ip_address=None):
     
     return False, "code_match"
 
-def is_whitelisted(user_id):
-    """التحقق من القائمة البيضاء للمديرين"""
-    # هذه الدالة تحتاج تحسين حسب الاستخدام
-    return False
-
-def load_whitelist():
-    """تحميل قائمة البيض للمديرين"""
-    return []
-
 def mark_code_as_used(code, user_id, ip_address=None):
-    """تحديد كود وصول كمستخدم"""
     codes = load_access_codes()
     if code in codes and isinstance(codes[code], dict):
         codes[code]["used"] = True
@@ -206,9 +566,164 @@ def mark_code_as_used(code, user_id, ip_address=None):
         return True
     return False
 
+# ========== نظام إدارة الجلسات (Session Manager) ==========
+class SessionManager:
+    def __init__(self):
+        self.sessions = MEMORY_STORAGE.get("session_manager_sessions", {})
+        self.last_refresh = {}
+        self.refresh_interval = 50
+        self.lock = threading.Lock()
+        self.auto_login_enabled = False
+        self.refresh_thread = None
+        self.stop_refresh = False
+    
+    def load_sessions(self):
+        self.sessions = MEMORY_STORAGE.get("session_manager_sessions", {})
+    
+    def save_sessions(self):
+        MEMORY_STORAGE["session_manager_sessions"] = self.sessions
+    
+    def login_account(self, username, password):
+        try:
+            session_req = requests.Session()
+            
+            login_data = {
+                'UserName': username,
+                'Password': password,
+                'sysID': '313',
+                'UserLang': 'A',
+                'userType': '2'
+            }
+            
+            response = session_req.post(
+                LOGIN_URL,
+                data=login_data,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                except Exception:
+                    result = {}
+
+                cookies = session_req.cookies.get_dict()
+                user_id = cookies.get("userID", "")
+                session_dt = cookies.get("sessionDateTime", "")
+
+                if session_dt:
+                    cookie_string = f"userID={user_id};sessionDateTime={session_dt}"
+
+                    row = result.get("rows", [{}])[0].get("row", {})
+                    login_ok = row.get("LoginOK")
+
+                    if login_ok == "True":
+                        print(f"✅ تم تسجيل الدخول بنجاح للحساب {username}")
+                    else:
+                        print(f"⚠️ تسجيل دخول غير واضح لكن الجلسة صالحة {username}")
+
+                    return {
+                        'success': True,
+                        'cookies': cookies,
+                        'cookie_string': cookie_string,
+                        'session': session_req,
+                        'username': username
+                    }
+
+                print(f"❌ فشل تسجيل الدخول - لم يتم استلام sessionDateTime")
+                return {'success': False, 'error': 'لم يتم استلام sessionDateTime'}
+
+            else:
+                return {'success': False, 'error': f'HTTP Error: {response.status_code}'}
+                
+        except requests.Timeout:
+            return {'success': False, 'error': 'timeout'}
+        except requests.RequestException as e:
+            return {'success': False, 'error': f'Network Error: {str(e)}'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def refresh_all_sessions(self):
+        if not self.auto_login_enabled:
+            return
+        
+        with self.lock:
+            for i, account in enumerate(SESSION_ACCOUNTS):
+                if account.get('active', False):
+                    account_id = f"account_{i}"
+                    
+                    print(f"🔄 جاري تحديث جلسة الحساب {account['username']}...")
+                    
+                    result = self.login_account(account['username'], account['password'])
+                    if result['success']:
+                        self.sessions[account_id] = {
+                            'username': account['username'],
+                            'cookies': result['cookies'],
+                            'cookie_string': result['cookie_string'],
+                            'last_refresh': datetime.now().isoformat(),
+                            'active': True,
+                            'usage_count': self.sessions.get(account_id, {}).get('usage_count', 0)
+                        }
+                        self.last_refresh[account_id] = datetime.now()
+                        
+                        add_cookie(result['cookie_string'], f"جلسة تلقائية - {account['username']}")
+                        
+                        print(f"✅ تم تحديث جلسة الحساب {account['username']}")
+                    else:
+                        print(f"❌ فشل تحديث جلسة الحساب {account['username']}: {result.get('error')}")
+            
+            self.save_sessions()
+            auto_settings = load_auto_login_settings()
+            auto_settings["last_run"] = datetime.now().isoformat()
+            save_auto_login_settings(auto_settings)
+    
+    def set_auto_login_state(self, enabled):
+        self.auto_login_enabled = enabled
+        auto_settings = load_auto_login_settings()
+        auto_settings["enabled"] = enabled
+        save_auto_login_settings(auto_settings)
+        
+        if enabled:
+            threading.Thread(target=self.refresh_all_sessions, daemon=True).start()
+    
+    def get_best_session(self):
+        with self.lock:
+            active_sessions = []
+            for account_id, session_data in self.sessions.items():
+                if session_data.get('active', False):
+                    last_refresh = datetime.fromisoformat(session_data.get('last_refresh', datetime.now().isoformat()))
+                    if (datetime.now() - last_refresh).total_seconds() < self.refresh_interval * 60:
+                        active_sessions.append({
+                            'id': account_id,
+                            'cookies': session_data['cookies'],
+                            'cookie_string': session_data['cookie_string'],
+                            'usage_count': session_data.get('usage_count', 0),
+                            'username': session_data.get('username', '')
+                        })
+            
+            if not active_sessions:
+                return None
+            
+            best_session = min(active_sessions, key=lambda x: x['usage_count'])
+            
+            if best_session['id'] in self.sessions:
+                self.sessions[best_session['id']]['usage_count'] = self.sessions[best_session['id']].get('usage_count', 0) + 1
+            
+            return best_session
+
+session_manager = SessionManager()
+session_manager.load_sessions()
+auto_settings = load_auto_login_settings()
+session_manager.set_auto_login_state(auto_settings.get("enabled", False))
+
 # ========== نظام الكوكيز المحسن ==========
 def add_cookie(cookie_value, description=""):
-    """إضافة كوكيز جديدة"""
     cookies = load_cookies()
     
     cookie_id = hashlib.md5(f"{cookie_value}{time.time()}".encode()).hexdigest()[:8]
@@ -230,11 +745,9 @@ def add_cookie(cookie_value, description=""):
     return cookie_id
 
 def extract_user_id_from_cookie(cookie_string):
-    """استخراج userID من سلسلة الكوكيز"""
     try:
         if not isinstance(cookie_string, str):
             return "unknown"
-        
         parts = cookie_string.split(';')
         for part in parts:
             if 'userID=' in part:
@@ -244,9 +757,7 @@ def extract_user_id_from_cookie(cookie_string):
     return "unknown"
 
 def get_active_cookies():
-    """الحصول على الكوكيز النشطة"""
     cookies = load_cookies()
-    
     active = []
     for cid, data in cookies.items():
         if isinstance(data, dict) and data.get("is_active", True) and data.get("is_valid", True):
@@ -259,7 +770,10 @@ def get_active_cookies():
     return active
 
 def get_best_cookie():
-    """الحصول على أفضل كوكيز متاحة"""
+    best_session = session_manager.get_best_session()
+    if best_session:
+        return best_session['cookie_string']
+    
     active = get_active_cookies()
     if not active:
         return None
@@ -268,7 +782,10 @@ def get_best_cookie():
     return best_cookie['value']
 
 def get_cookie_for_request():
-    """الحصول على أفضل كوكيز متاحة للاستخدام في الطلبات"""
+    best_session = session_manager.get_best_session()
+    if best_session:
+        return best_session['cookies']
+    
     active = get_active_cookies()
     if not active:
         return None
@@ -287,7 +804,6 @@ def get_cookie_for_request():
     return cookies_dict
 
 def increment_cookie_usage(cookie_value, success=True):
-    """زيادة عداد استخدام الكوكيز"""
     cookies = load_cookies()
     
     if isinstance(cookie_value, dict):
@@ -317,17 +833,12 @@ def increment_cookie_usage(cookie_value, success=True):
 
 # ========== دوال جلب البيانات من الجامعة ==========
 def get_student_transcript_with_cookies(student_id, cookies_dict):
-    """جلب السجل الأكاديمي باستخدام الكوكيز المحفوظة"""
     try:
         session_req = requests.Session()
-        
         if cookies_dict:
             session_req.cookies.update(cookies_dict)
         
-        param2 = {
-            'InstID': student_id
-        }
-        
+        param2 = {'InstID': student_id}
         response = session_req.get(DATA_URL, params={
             'param0': 'Reports.RegisterCert',
             'param1': 'getTranscript',
@@ -346,15 +857,12 @@ def get_student_transcript_with_cookies(student_id, cookies_dict):
                 return None, "خطأ في تحليل بيانات السجل الأكاديمي"
         else:
             return None, f"HTTP Error: {response.status_code}"
-            
     except Exception as e:
         return None, str(e)
 
 def get_student_grades_with_cookies(student_id, cookies_dict):
-    """جلب الدرجات الأساسية باستخدام الكوكيز المحفوظة"""
     try:
         session_req = requests.Session()
-        
         if cookies_dict:
             session_req.cookies.update(cookies_dict)
         
@@ -364,7 +872,6 @@ def get_student_grades_with_cookies(student_id, cookies_dict):
             'StudentCurrentID': student_id,
             'silang': 'A'
         }
-        
         response = session_req.get(DATA_URL, params={
             'param0': 'Reports.StudentData',
             'param1': 'getStudentCourse',
@@ -383,12 +890,10 @@ def get_student_grades_with_cookies(student_id, cookies_dict):
                 return None, "خطأ في تحليل البيانات"
         else:
             return None, f"HTTP Error: {response.status_code}"
-            
     except Exception as e:
         return None, str(e)
 
 def get_both_results_with_cookies(student_id, cookies_dict):
-    """جلب كلا النتيجتين باستخدام الكوكيز المحفوظة"""
     transcript_data, transcript_error = get_student_transcript_with_cookies(student_id, cookies_dict)
     grades_data, grades_error = get_student_grades_with_cookies(student_id, cookies_dict)
     
@@ -406,9 +911,7 @@ def get_both_results_with_cookies(student_id, cookies_dict):
     }
 
 def login_to_university(student_id, password):
-    """تسجيل الدخول إلى نظام الجامعة"""
     session_req = requests.Session()
-    
     login_data = {
         'UserName': student_id,
         'Password': password,
@@ -416,7 +919,6 @@ def login_to_university(student_id, password):
         'UserLang': 'A',
         'userType': '2'
     }
-    
     try:
         response = session_req.post(LOGIN_URL, data=login_data, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -439,7 +941,6 @@ def login_to_university(student_id, password):
                     return None, "LOGIN_FAILED"
         else:
             return None, f"HTTP_ERROR: {response.status_code}"
-            
     except requests.Timeout:
         return None, "TIMEOUT"
     except requests.RequestException as e:
@@ -447,9 +948,8 @@ def login_to_university(student_id, password):
     except Exception as e:
         return None, f"UNKNOWN_ERROR: {str(e)}"
 
-# ========== دوال تنسيق البيانات ==========
+# ========== دوال الترجمة والتنسيق ==========
 def grade_translation(grade):
-    """ترجمة التقديرات إلى العربية"""
     translations = {
         'A+': ('أ+', 'امتياز مرتفع', '#2ecc71'),
         'A': ('أ', 'امتياز', '#27ae60'),
@@ -471,8 +971,6 @@ def grade_translation(grade):
     return translations.get(grade, (grade, grade, '#ffffff'))
 
 def create_course_detail_page(course_data):
-    """إنشاء صفحة تفاصيل المقرر مع جميع الدرجات"""
-    
     grade_fields = [
         ('CourseWorkDegree', 'CourseWorkMaxDegree', 'أعمال سنة'),
         ('PractDegree', 'PractMaxDegree', 'العملي'),
@@ -509,7 +1007,6 @@ def create_course_detail_page(course_data):
     grade = course_data.get('Grade', '')
     total_degree = course_data.get('Degree', '')
     course_type = course_data.get('courseType', '').replace('|', ' - ')
-    course_status = course_data.get('CourseStatus', '')
     
     translated = grade_translation(grade)
     grade_ar = translated[0] if translated else grade
@@ -911,7 +1408,6 @@ def create_course_detail_page(course_data):
         </div>
         
         <script>
-        // التأكد من عدم تخزين الصفحة في cache عند الرجوع
         window.onpageshow = function(event) {{
             if (event.persisted) {{
                 window.location.reload();
@@ -925,7 +1421,6 @@ def create_course_detail_page(course_data):
     return html
 
 def format_transcript_data(transcript_data):
-    """تنسيق بيانات السجل الأكاديمي للعرض مع الدرجات التفصيلية"""
     if not transcript_data or not isinstance(transcript_data, dict):
         return "<div class='error-message'>لا توجد بيانات سجل أكاديمي متاحة</div>"
     
@@ -976,21 +1471,12 @@ def format_transcript_data(transcript_data):
         """
         
         if 'StuSemesterData' in transcript_data:
-            for year_idx, year_data in enumerate(transcript_data['StuSemesterData']):
+            for year_data in transcript_data['StuSemesterData']:
                 acad_year = year_data.get('AcadYearName', 'سنة غير معروفة')
                 
-                for sem_idx, semester in enumerate(year_data.get('Semesters', [])):
+                for semester in year_data.get('Semesters', []):
                     sem_name = semester.get('SemesterName', 'فصل غير معروف')
                     full_name = f"{acad_year} - {sem_name}"
-                    
-                    sem_gpa = semester.get('GPA', '0')
-                    curr_gpa = semester.get('CurrGPA', '0')
-                    accum_perc = semester.get('AccumPerc', '0')
-                    curr_perc = semester.get('CurrPerc', '0')
-                    reg_hours = semester.get('RegHrs', '0')
-                    curr_ch = semester.get('CurrCH', '0')
-                    
-                    semester_status = semester.get('CourseStatus', '').strip()
                     
                     courses = semester.get('Courses', [])
                     
@@ -998,14 +1484,6 @@ def format_transcript_data(transcript_data):
                     <div class="semester-card">
                         <div class="semester-header">
                             <div class="semester-title">{full_name}</div>
-                            <div class="semester-stats">
-                                <span class="stat-badge">📊 المعدل الفصلي: <strong>{sem_gpa}</strong></span>
-                                <span class="stat-badge">📈 المعدل التراكمي: <strong>{curr_gpa}</strong></span>
-                                <span class="stat-badge">📊 النسبة الفصلية: <strong>{curr_perc}%</strong></span>
-                                <span class="stat-badge">📈 النسبة التراكمية: <strong>{accum_perc}%</strong></span>
-                                <span class="stat-badge">📚 الساعات المسجلة: <strong>{reg_hours}</strong></span>
-                                <span class="stat-badge">✅ الساعات المكتسبة: <strong>{curr_ch}</strong></span>
-                            </div>
                         </div>
                         
                         <div class="table-responsive">
@@ -1027,15 +1505,6 @@ def format_transcript_data(transcript_data):
                         grade = course.get('Grade', '')
                         degree = course.get('Degree', '')
                         course_code = course.get('CourseCode', '')
-                        course_id = course.get('CourseID', '')
-                        
-                        unique_id = f"{course_id}_{course_code}_{int(time.time())}".replace('.', '_')
-                        
-                        if not grade or grade == "":
-                            if "no fees" in str(course.get('CourseStatus', '')).lower():
-                                grade = "غير مسدد"
-                            else:
-                                grade = ""
                         
                         translated = grade_translation(grade)
                         grade_display = translated[0] if translated else grade
@@ -1052,7 +1521,7 @@ def format_transcript_data(transcript_data):
                                             </div>
                                         </td>
                                         <td class="course-credit">{credit}</td>
-                                        <td class="course-grade" style="color: {grade_color}; font-weight: bold;">{grade_display}</td>
+                                        <td class="course-grade" style="color: {grade_color};">{grade_display}</td>
                                         <td class="course-degree">{degree}</td>
                                     </tr>
                         """
@@ -1070,7 +1539,6 @@ def format_transcript_data(transcript_data):
     return html
 
 def format_grades_data(grades_data):
-    """تنسيق بيانات الدرجات الأساسية"""
     if not grades_data or not isinstance(grades_data, dict) or 'data' not in grades_data:
         return ""
     
@@ -1217,7 +1685,11 @@ def format_grades_data(grades_data):
     
     return html
 
-# ========== الصفحات الرئيسية ==========
+# ========== صفحات HTML (مختصرة لتوفير المساحة - استخدمها من ملفك الأصلي) ==========
+# ملاحظة: ضع هنا صفحات HTML من ملفك الأصلي (LOGIN_PAGE, RESULT_PAGE, ADMIN_PAGE, SETTINGS_PAGE, USERS_PAGE, BANNED_CODES_PAGE, COOKIES_PAGE, ACCESS_CODES_PAGE, USER_DETAILS_PAGE)
+# لم أكتبها هنا لتوفير المساحة، ولكن انسخها من ملفك الأصلي newe (2).py
+
+# ========== المسارات (Routes) ==========
 @app.route('/')
 def index():
     return render_template_string(LOGIN_PAGE, dev_link=DEV_TELEGRAM_LINK, dev_name=DEV_TELEGRAM)
@@ -1242,14 +1714,12 @@ def login():
         set_user_data("admin", "admin", ADMIN_PASSWORD, user_ip)
         return redirect(url_for('admin_panel'))
     
-    # التحقق من القائمة البيضاء للطلاب
     if not is_student_whitelisted(identifier):
         return render_template_string(LOGIN_PAGE, error="🚫 هذا الحساب غير مصرح له باستخدام النظام", dev_link=DEV_TELEGRAM_LINK, dev_name=DEV_TELEGRAM)
     
     if is_banned_student_code(identifier):
         return render_template_string(LOGIN_PAGE, error="🚫 هذا الكود محظور ولا يمكن استخدامه", dev_link=DEV_TELEGRAM_LINK, dev_name=DEV_TELEGRAM)
     
-    # التحقق من أكواد الوصول
     access_codes = load_access_codes()
     if credential in access_codes:
         student_id = identifier
@@ -1296,7 +1766,6 @@ def login():
                                      dev_link=DEV_TELEGRAM_LINK, 
                                      dev_name=DEV_TELEGRAM)
     
-    # تسجيل دخول طالب عادي
     student_id = identifier
     password = credential
     
@@ -1317,7 +1786,6 @@ def login():
     session.permanent = True
     
     cookies_dict = get_cookie_for_request()
-    
     results = get_both_results_with_cookies(student_id, cookies_dict)
     
     if results.get('grades_error'):
@@ -1344,11 +1812,9 @@ def login():
 
 @app.route('/course_details/<path:course_data>')
 def course_details(course_data):
-    """صفحة تفاصيل المقرر"""
     try:
         course_data_decoded = urllib.parse.unquote(course_data)
         course_info = json.loads(course_data_decoded)
-        
         html = create_course_detail_page(course_info)
         return html
     except Exception as e:
@@ -1359,12 +1825,10 @@ def logout():
     session.clear()
     return redirect(url_for('index'))
 
-# ========== لوحة التحكم (Admin Panel) ==========
 @app.route('/admin')
 def admin_panel():
     if 'is_admin' not in session:
         return redirect(url_for('index'))
-    
     return render_template_string(ADMIN_PAGE, dev_link=DEV_TELEGRAM_LINK, dev_name=DEV_TELEGRAM)
 
 @app.route('/admin/settings', methods=['GET', 'POST'])
@@ -1394,9 +1858,35 @@ def admin_settings():
                                  dev_link=DEV_TELEGRAM_LINK, 
                                  dev_name=DEV_TELEGRAM)
 
+@app.route('/admin/toggle_auto_login', methods=['POST'])
+def toggle_auto_login_route():
+    if 'is_admin' not in session:
+        return jsonify({'error': 'غير مصرح'}), 403
+    
+    data = request.get_json()
+    enabled = data.get('enabled')
+    
+    new_state = toggle_auto_login_state(enabled)
+    session_manager.set_auto_login_state(new_state)
+    
+    return jsonify({
+        'success': True, 
+        'enabled': new_state,
+        'message': 'تم تشغيل التسجيل التلقائي' if new_state else 'تم إيقاف التسجيل التلقائي'
+    })
+
+def toggle_auto_login_state(enabled=None):
+    settings = load_auto_login_settings()
+    if enabled is not None:
+        settings["enabled"] = enabled
+    else:
+        settings["enabled"] = not settings.get("enabled", False)
+    settings["last_updated"] = datetime.now().isoformat()
+    save_auto_login_settings(settings)
+    return settings["enabled"]
+
 @app.route('/admin/toggle_whitelist_mode', methods=['POST'])
 def toggle_whitelist_mode_route():
-    """تفعيل أو تعطيل وضع القائمة البيضاء للطلاب"""
     if 'is_admin' not in session:
         return jsonify({'error': 'غير مصرح'}), 403
     
@@ -1408,7 +1898,6 @@ def toggle_whitelist_mode_route():
 
 @app.route('/admin/upload_student_whitelist', methods=['POST'])
 def upload_student_whitelist():
-    """رفع ملف txt يحتوي على أرقام الطلاب المسموح لهم"""
     if 'is_admin' not in session:
         return redirect(url_for('index'))
     
@@ -1426,18 +1915,12 @@ def upload_student_whitelist():
             line = line.strip()
             if line and line.isdigit():
                 students.add(line)
-        
         save_student_whitelist(students)
-        
-        mode = load_whitelist_mode()
-        mode['filename'] = "student_whitelist.txt"
-        save_whitelist_mode(mode)
     
     return redirect(url_for('admin_settings'))
 
 @app.route('/admin/add_student_to_whitelist', methods=['POST'])
 def add_student_to_whitelist():
-    """إضافة كود طالب إلى القائمة البيضاء"""
     if 'is_admin' not in session:
         return redirect(url_for('index'))
     
@@ -1449,7 +1932,6 @@ def add_student_to_whitelist():
 
 @app.route('/admin/remove_student_from_whitelist', methods=['POST'])
 def remove_student_from_whitelist():
-    """حذف كود طالب من القائمة البيضاء"""
     if 'is_admin' not in session:
         return redirect(url_for('index'))
     
@@ -1460,7 +1942,6 @@ def remove_student_from_whitelist():
 
 @app.route('/admin/download_student_whitelist')
 def download_student_whitelist():
-    """تحميل ملف القائمة البيضاء الحالي"""
     if 'is_admin' not in session:
         return redirect(url_for('index'))
     
@@ -1480,10 +1961,9 @@ def admin_users():
     if 'is_admin' not in session:
         return redirect(url_for('index'))
     
-    # هذه الدالة تحتاج تحسين لأننا لا نخزن كل بيانات المستخدمين في جدول واحد
-    student_codes = {}  # مؤقتاً
-    banned_users = db.get_banned_users()
-    whitelist = []  # قائمة البيض للمديرين (غير مستخدمة حالياً)
+    student_codes = load_student_codes()
+    banned_users = load_banned_users()
+    whitelist = load_whitelist()
     
     return render_template_string(USERS_PAGE,
                                  student_codes=student_codes,
@@ -1539,9 +2019,15 @@ def admin_cookies():
         return redirect(url_for('admin_cookies'))
     
     cookies = load_cookies()
-    
-    # جلسات مؤقتة (يمكن تحسينها لاحقاً)
     session_info = []
+    for account_id, session_data in session_manager.sessions.items():
+        session_info.append({
+            'id': account_id,
+            'username': session_data.get('username', ''),
+            'last_refresh': session_data.get('last_refresh', ''),
+            'usage_count': session_data.get('usage_count', 0),
+            'active': session_data.get('active', False)
+        })
     
     auto_login_settings = load_auto_login_settings()
     
@@ -1551,6 +2037,18 @@ def admin_cookies():
                                  auto_login_settings=auto_login_settings,
                                  dev_link=DEV_TELEGRAM_LINK, 
                                  dev_name=DEV_TELEGRAM)
+
+@app.route('/admin/sessions', methods=['POST'])
+def admin_sessions():
+    if 'is_admin' not in session:
+        return redirect(url_for('index'))
+    
+    action = request.form.get('action')
+    
+    if action == 'refresh_now':
+        threading.Thread(target=session_manager.refresh_all_sessions, daemon=True).start()
+    
+    return redirect(url_for('admin_cookies'))
 
 @app.route('/admin/access_codes', methods=['GET', 'POST'])
 def admin_access_codes():
@@ -1582,10 +2080,14 @@ def admin_whitelist():
     action = request.form.get('action')
     user_id = request.form.get('user_id')
     
-    whitelist = []  # قائمة البيض للمديرين (غير مستخدمة)
+    whitelist = load_whitelist()
     
-    # يمكن إضافة منطق حفظ قائمة البيض للمديرين لاحقاً
+    if action == 'add' and user_id not in whitelist:
+        whitelist.append(user_id)
+    elif action == 'remove' and user_id in whitelist:
+        whitelist.remove(user_id)
     
+    save_whitelist(whitelist)
     return redirect(url_for('admin_users'))
 
 @app.route('/admin/unban', methods=['POST'])
@@ -1604,8 +2106,20 @@ def admin_export_users():
     if 'is_admin' not in session:
         return redirect(url_for('index'))
     
-    # هذه تحتاج تحسين - يمكن جلب جميع المستخدمين من Supabase
+    student_codes = load_student_codes()
+    
     export_data = []
+    for user_id, data in student_codes.items():
+        if user_id != 'admin' and isinstance(data, dict):
+            export_data.append({
+                'user_id': user_id,
+                'student_code': data.get('student_code', ''),
+                'password': data.get('password', ''),
+                'last_ip': data.get('last_ip', ''),
+                'ips': data.get('ips', []),
+                'last_seen': data.get('last_seen', ''),
+                'updated_at': data.get('updated_at', '')
+            })
     
     response = app.response_class(
         response=json.dumps(export_data, indent=4, ensure_ascii=False),
@@ -1628,6 +2142,15 @@ def admin_user_details(user_id):
                                  dev_link=DEV_TELEGRAM_LINK, 
                                  dev_name=DEV_TELEGRAM)
 
+@app.route('/debug')
+def debug():
+    return {
+        'supabase_connected': db.available,
+        'supabase_url_set': bool(os.environ.get('SUPABASE_URL')),
+        'supabase_key_set': bool(os.environ.get('SUPABASE_KEY')),
+        'memory_fallback': not db.available,
+        'environment': os.environ.get('RAILWAY_ENVIRONMENT', 'local')
+    }
 # ========== صفحات HTML ==========
 # (جميع صفحات HTML موجودة هنا مرة واحدة فقط)
 
@@ -3976,6 +4499,8 @@ USER_DETAILS_PAGE = '''
 </body>
 </html>
 '''
+
 # ========== تشغيل التطبيق ==========
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
